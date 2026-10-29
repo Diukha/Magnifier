@@ -7,28 +7,16 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <magnification.h>
 #include <string>
 #include "geometry.h"
 #include "color.h"
-
-// MinGW's magnification.h supplies the structures but omits these desktop APIs.
-extern "C" {
-__declspec(dllimport) BOOL WINAPI MagInitialize();
-__declspec(dllimport) BOOL WINAPI MagUninitialize();
-__declspec(dllimport) BOOL WINAPI MagSetWindowSource(HWND, RECT);
-__declspec(dllimport) BOOL WINAPI MagSetWindowTransform(HWND, PMAGTRANSFORM);
-__declspec(dllimport) BOOL WINAPI MagSetWindowFilterList(HWND, DWORD, int, HWND*);
-}
-constexpr wchar_t kMagnifierClass[] = L"Magnifier";
+#include "renderer.h"
 
 namespace {
 constexpr wchar_t kClass[] = L"MouseLens.Window.v1";
-constexpr wchar_t kFrameClass[] = L"MouseLens.Frame.v1";
 constexpr UINT kUpdate = WM_APP + 1;
-constexpr int kBorder = 3;
-HWND host = nullptr, magnifier = nullptr;
-HWND borderWindows[4] = {};
+HWND host = nullptr;
+lens::Renderer renderer;
 lens::Color borderColor = lens::kDefaultBorder;
 HHOOK keyboardHook = nullptr, mouseHook = nullptr;
 lens::State state;
@@ -39,13 +27,12 @@ std::wstring settingsPath;
 void CloseLens() {
     if (closing) return;
     closing = true;
-    for (HWND border : borderWindows) if (border) ShowWindow(border, SW_HIDE);
     ShowWindow(host, SW_HIDE);
     PostMessageW(host, WM_CLOSE, 0, 0);
 }
 
 void Update() {
-    if (closing || !magnifier) return;
+    if (closing || !host) return;
     POINT p{};
     if (!GetCursorPos(&p)) return;
     MONITORINFO mi{};
@@ -54,34 +41,12 @@ void Update() {
     const RECT r = mi.rcMonitor;
     lens::Rect monitor{r.left, r.top, r.right-r.left, r.bottom-r.top};
     const auto frame = lens::window(state, monitor, p.x, p.y);
-    SetWindowPos(host, HWND_TOPMOST, frame.x+kBorder, frame.y+kBorder,
-                 frame.w-2*kBorder, frame.h-2*kBorder,
-                 SWP_NOACTIVATE | SWP_NOREDRAW);
-    MoveWindow(magnifier, 0, 0, frame.w-2*kBorder, frame.h-2*kBorder, FALSE);
-    // Separate, non-overlapping strips let only the border be translucent.
-    // The magnified contents retain full opacity, including black pixels.
-    const lens::Rect strips[] = {
-        {frame.x, frame.y, frame.w, kBorder},
-        {frame.x, frame.y+frame.h-kBorder, frame.w, kBorder},
-        {frame.x, frame.y+kBorder, kBorder, frame.h-2*kBorder},
-        {frame.x+frame.w-kBorder, frame.y+kBorder, kBorder, frame.h-2*kBorder}
-    };
-    for (int i=0; i<4; ++i) {
-        const auto& strip = strips[i];
-        SetWindowPos(borderWindows[i], HWND_TOPMOST, strip.x, strip.y, strip.w, strip.h,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
-    lens::Rect interior{frame.x+kBorder, frame.y+kBorder,
-                        frame.w-2*kBorder, frame.h-2*kBorder};
+    lens::Rect interior{frame.x+lens::kBorder, frame.y+lens::kBorder,
+                        frame.w-2*lens::kBorder, frame.h-2*lens::kBorder};
     const auto src = lens::source(interior, monitor, p.x, p.y, state.zoom);
-    MAGTRANSFORM matrix{};
-    matrix.v[0][0] = state.zoom;
-    matrix.v[1][1] = state.zoom;
-    matrix.v[2][2] = 1.0f;
-    MagSetWindowTransform(magnifier, &matrix);
-    MagSetWindowSource(magnifier, {src.x, src.y, src.x+src.w, src.y+src.h});
-    InvalidateRect(host, nullptr, FALSE);
-    InvalidateRect(magnifier, nullptr, TRUE);
+    // Failed capture keeps the last complete frame; no blank frame is shown.
+    if (!renderer.render(host, frame, src, borderColor))
+        OutputDebugStringW(L"MouseLens: frame capture/presentation failed.\n");
 }
 
 LRESULT CALLBACK Keyboard(int code, WPARAM message, LPARAM data) {
@@ -126,25 +91,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case kUpdate: Update(); return 0;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
     case WM_CLOSE: closing = true; DestroyWindow(hwnd); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-LRESULT CALLBACK FrameProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
-    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
-    if (msg == WM_ERASEBKGND) return 1;
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps{};
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT r{}; GetClientRect(hwnd, &r);
-        HBRUSH brush = CreateSolidBrush(RGB(borderColor.r, borderColor.g, borderColor.b));
-        FillRect(dc, &r, brush);
-        DeleteObject(brush);
-        EndPaint(hwnd, &ps);
-        return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -182,10 +131,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         CloseHandle(mutex);
         return 0;
     }
-    if (!MagInitialize()) {
-        MessageBoxW(nullptr, L"Windows Magnification API could not initialize.", L"MouseLens", MB_OK|MB_ICONERROR);
-        CloseHandle(mutex); return 1;
-    }
     LoadSettings();
     WNDCLASSW cls{};
     cls.lpfnWndProc = WindowProc;
@@ -193,34 +138,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     cls.lpszClassName = kClass;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&cls);
-    WNDCLASSW frameCls = cls;
-    frameCls.lpfnWndProc = FrameProc;
-    frameCls.lpszClassName = kFrameClass;
-    RegisterClassW(&frameCls);
     host = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,
                           kClass, L"MouseLens", WS_POPUP, 0, 0, state.width, state.height,
                           nullptr, nullptr, instance, nullptr);
-    if (host) {
-        SetLayeredWindowAttributes(host, 0, 255, LWA_ALPHA);
-        // Do not use MS_SHOWMAGNIFIEDCURSOR: Windows already draws the real
-        // pointer above this window. Capturing it creates a second, lagging copy.
-        magnifier = CreateWindowExW(0, kMagnifierClass, L"Lens", WS_CHILD|WS_VISIBLE,
-                                   0,0,state.width-2*kBorder,state.height-2*kBorder,
-                                   host,nullptr,instance,nullptr);
-    }
-    bool bordersReady = host != nullptr;
-    if (host) for (HWND& border : borderWindows) {
-        border = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,
-                                 kFrameClass, L"", WS_POPUP, 0, 0, 1, 1, host, nullptr, instance, nullptr);
-        if (!border || !SetLayeredWindowAttributes(border, 0, borderColor.a, LWA_ALPHA)) bordersReady = false;
-    }
-    if (!host || !magnifier || !bordersReady) {
-        MessageBoxW(nullptr, L"Could not create the magnifier window.", L"MouseLens", MB_OK|MB_ICONERROR);
+    if (!host || !SetWindowDisplayAffinity(host, WDA_EXCLUDEFROMCAPTURE)) {
+        MessageBoxW(nullptr, L"Could not create a capture-excluded lens window. Windows 10 version 2004 or newer is required.", L"MouseLens", MB_OK|MB_ICONERROR);
         if (host) DestroyWindow(host);
-        MagUninitialize(); CloseHandle(mutex); return 1;
+        CloseHandle(mutex); return 1;
     }
-    HWND excluded[] = {host, borderWindows[0], borderWindows[1], borderWindows[2], borderWindows[3]};
-    MagSetWindowFilterList(magnifier, MW_FILTERMODE_EXCLUDE, 5, excluded);
     for (int i=0;i<256;++i) heldAtLaunch[i] = (GetAsyncKeyState(i)&0x8000)!=0;
     keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, Keyboard, instance, 0);
     mouseHook = SetWindowsHookExW(WH_MOUSE_LL, Mouse, instance, 0);
@@ -228,7 +153,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         if (keyboardHook) UnhookWindowsHookEx(keyboardHook);
         if (mouseHook) UnhookWindowsHookEx(mouseHook);
         DestroyWindow(host);
-        MagUninitialize(); CloseHandle(mutex);
+        CloseHandle(mutex);
         MessageBoxW(nullptr, L"Could not install input hooks.", L"MouseLens", MB_OK|MB_ICONERROR);
         return 1;
     }
@@ -243,7 +168,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     UnhookWindowsHookEx(keyboardHook);
     UnhookWindowsHookEx(mouseHook);
     SaveSettings();
-    MagUninitialize();
     CloseHandle(mutex);
     return result == -1 ? 1 : 0;
 }
