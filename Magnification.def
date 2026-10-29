@@ -1,0 +1,7 @@
+LIBRARY Magnification.dll
+EXPORTS
+MagInitialize
+MagUninitialize
+MagSetWindowSource
+MagSetWindowTransform
+MagSetWindowFilterList
