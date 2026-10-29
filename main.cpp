@@ -31,13 +31,13 @@ void CloseLens() {
     PostMessageW(host, WM_CLOSE, 0, 0);
 }
 
-void Update() {
-    if (closing || !host) return;
+bool Update() {
+    if (closing || !host) return false;
     POINT p{};
-    if (!GetCursorPos(&p)) return;
+    if (!GetCursorPos(&p)) return false;
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &mi)) return;
+    if (!GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &mi)) return false;
     const RECT r = mi.rcMonitor;
     lens::Rect monitor{r.left, r.top, r.right-r.left, r.bottom-r.top};
     const auto frame = lens::window(state, monitor, p.x, p.y);
@@ -45,8 +45,11 @@ void Update() {
                         frame.w-2*lens::kBorder, frame.h-2*lens::kBorder};
     const auto src = lens::source(interior, monitor, p.x, p.y, state.zoom);
     // Failed capture keeps the last complete frame; no blank frame is shown.
-    if (!renderer.render(host, frame, src, borderColor))
+    if (!renderer.render(host, frame, src, borderColor)) {
         OutputDebugStringW(L"MouseLens: frame capture/presentation failed.\n");
+        return false;
+    }
+    return true;
 }
 
 LRESULT CALLBACK Keyboard(int code, WPARAM message, LPARAM data) {
@@ -87,8 +90,8 @@ LRESULT CALLBACK Mouse(int code, WPARAM message, LPARAM data) {
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_TIMER:
-    case kUpdate: Update(); return 0;
+    // State changes are coalesced into the next GPU frame. No frame backlog.
+    case kUpdate: return 0;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_NCHITTEST: return HTTRANSPARENT;
     case WM_ERASEBKGND: return 1;
@@ -138,7 +141,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     cls.lpszClassName = kClass;
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     RegisterClassW(&cls);
-    host = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,
+    host = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOREDIRECTIONBITMAP|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE,
                           kClass, L"MouseLens", WS_POPUP, 0, 0, state.width, state.height,
                           nullptr, nullptr, instance, nullptr);
     if (!host || !SetWindowDisplayAffinity(host, WDA_EXCLUDEFROMCAPTURE)) {
@@ -157,17 +160,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         MessageBoxW(nullptr, L"Could not install input hooks.", L"MouseLens", MB_OK|MB_ICONERROR);
         return 1;
     }
-    Update();
+    if (!Update()) {
+        UnhookWindowsHookEx(keyboardHook);UnhookWindowsHookEx(mouseHook);
+        DestroyWindow(host);CloseHandle(mutex);
+        wchar_t error[256]{};
+        wsprintfW(error,L"Could not start GPU desktop capture (HRESULT 0x%08X).",UINT(renderer.error()));
+        MessageBoxW(nullptr,error,L"MouseLens",MB_OK|MB_ICONERROR);
+        return 1;
+    }
     ShowWindow(host, SW_SHOWNOACTIVATE);
-    SetTimer(host, 1, 16, nullptr);
     MSG msg{};
-    int result;
-    while ((result = GetMessageW(&msg,nullptr,0,0)) > 0) {
-        TranslateMessage(&msg); DispatchMessageW(&msg);
+    bool quit=false;
+    while (!quit) {
+        HANDLE ready=renderer.frameReady();
+        DWORD waited=MsgWaitForMultipleObjectsEx(ready?1:0,ready?&ready:nullptr,
+                                                ready?100:16,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+        while (PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) {
+            if(msg.message==WM_QUIT) { quit=true; break; }
+            TranslateMessage(&msg);DispatchMessageW(&msg);
+        }
+        if(!quit && ((!ready && waited==WAIT_TIMEOUT) || (ready && waited==WAIT_OBJECT_0))) Update();
     }
     UnhookWindowsHookEx(keyboardHook);
     UnhookWindowsHookEx(mouseHook);
     SaveSettings();
     CloseHandle(mutex);
-    return result == -1 ? 1 : 0;
+    return 0;
 }

@@ -7,7 +7,7 @@ try {
     $toolDirectory = Split-Path -Parent $Compiler
     & "$toolDirectory\llvm-windres.exe" app.rc -O coff -o build/app.res
     if ($LASTEXITCODE) { throw 'Resource compilation failed' }
-    & $Compiler -std=c++17 -O2 -Wall -Wextra -Wpedantic -static -municode -mwindows main.cpp build/app.res -luser32 -lgdi32 '-Wl,--dynamicbase' '-Wl,--nxcompat' -o dist/MouseLens.exe
+    & $Compiler -std=c++17 -O2 -Wall -Wextra -Wpedantic -static -municode -mwindows main.cpp build/app.res -luser32 -lgdi32 -ld3d11 -ldxgi -ldcomp -ld3dcompiler -lruntimeobject '-Wl,--dynamicbase' '-Wl,--nxcompat' -o dist/MouseLens.exe
     if ($LASTEXITCODE) { throw 'Compilation failed' }
     & $Compiler -std=c++17 -O2 -Wall -Wextra -static tests/geometry_test.cpp -o build/geometry_test.exe
     if ($LASTEXITCODE) { throw 'Test compilation failed' }
